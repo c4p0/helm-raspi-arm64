@@ -23,8 +23,63 @@
 #include "startup.h"
 #include "utils.h"
 
+#include <iostream>
+
 #define MAX_OUTPUT_MEMORY 1048576
 #define MAX_BUFFER_PROCESS 256
+
+namespace {
+  // JUCE's JACK backend opens the first JACK client in port order as the audio "device",
+  // without checking it can play audio. Under PipeWire that order changes between boots
+  // (filters, monitors, the MIDI bridge...), so Helm sometimes starts with no outputs.
+  // If that happens, try the output devices in order (the ones whose name contains
+  // HELM_JACK_OUTPUT first, e.g. "Mbox") and keep the first with "playback_*" channels.
+  bool hasPlayback(AudioDeviceManager& manager) {
+    AudioIODevice* device = manager.getCurrentAudioDevice();
+    if (device == nullptr)
+      return false;
+    for (const String& name : device->getOutputChannelNames()) {
+      if (name.startsWith("playback"))
+        return true;
+    }
+    return false;
+  }
+
+  void selectJackOutput(AudioDeviceManager& manager) {
+    AudioIODevice* device = manager.getCurrentAudioDevice();
+    if (device == nullptr || device->getTypeName() != "JACK" ||
+        device->getOutputChannelNames().size() > 0)
+      return;
+
+    AudioIODeviceType* type = manager.getCurrentDeviceTypeObject();
+    if (type == nullptr)
+      return;
+
+    String wanted = SystemStats::getEnvironmentVariable("HELM_JACK_OUTPUT", "");
+    StringArray candidates;
+    for (const String& name : type->getDeviceNames(false)) {
+      if (wanted.isNotEmpty() && name.containsIgnoreCase(wanted))
+        candidates.insert(0, name);
+      else if (name != "Helm" && name != "Midi-Bridge")
+        candidates.add(name);
+    }
+
+    AudioDeviceManager::AudioDeviceSetup original;
+    manager.getAudioDeviceSetup(original);
+    for (const String& name : candidates) {
+      AudioDeviceManager::AudioDeviceSetup setup = original;
+      setup.outputDeviceName = name;
+      setup.inputDeviceName = String();
+      setup.useDefaultOutputChannels = true;
+      setup.useDefaultInputChannels = true;
+      if (manager.setAudioDeviceSetup(setup, true).isEmpty() && hasPlayback(manager)) {
+        std::cerr << "Helm: JACK output -> " << name << std::endl;
+        return;
+      }
+    }
+    std::cerr << "Helm: no JACK output with playback ports found" << std::endl;
+  }
+}
 
 HelmEditor::HelmEditor(bool use_gui) : SynthGuiInterface(this, use_gui) {
   computer_keyboard_ = new HelmComputerKeyboard(&engine_, keyboard_state_);
@@ -45,6 +100,8 @@ HelmEditor::HelmEditor(bool use_gui) : SynthGuiInterface(this, use_gui) {
         break;
     }
   }
+
+  selectJackOutput(deviceManager);
 
   const StringArray all_midi_ins(MidiInput::getDevices());
 
